@@ -1,0 +1,463 @@
+openapi: 3.1.0
+info:
+  title: Agents Service IdP Bridge
+  version: 0.1.0
+  description: >
+    OAuth2 bridge endpoints for the Agents Service. These endpoints proxy
+    authorization and token flows to the Identity platform and expose discovery
+    metadata via .well-known endpoints.
+servers:
+  - url: https://{tenant-url}
+    variables:
+      tenant-url:
+        default: aigw-mgogax.data.aigw.integration-cyberark.cloud
+tags:
+  - name: OAuth2
+    description: OAuth 2.0 authorization and token endpoints.
+  - name: WellKnown
+    description: Discovery metadata under .well-known.
+  - name: MCP
+    description: MCP gateway endpoints.
+paths:
+  /OAuth2/Authorize:
+    get:
+      tags: [OAuth2]
+      summary: OAuth2 authorization endpoint
+      description: >
+        Redirects the user agent to the tenant-specific Identity authorization
+        endpoint based on the provided client_id. All query parameters are
+        preserved and forwarded.
+      operationId: oauth2Authorize
+      parameters:
+        - $ref: '#/components/parameters/clientId'
+        - name: response_type
+          in: query
+          required: false
+          schema:
+            type: string
+          example: code
+          description: OAuth2 response type (e.g., "code", "id_token").
+        - name: redirect_uri
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uri
+          example: https://example.com/callback
+          description: Client redirect URI.
+        - name: scope
+          in: query
+          required: false
+          schema:
+            type: string
+          example: full
+          description: "OAuth2 scope string. Supported: full."
+        - name: state
+          in: query
+          required: false
+          schema:
+            type: string
+          example: STATE
+          description: Opaque value used by the client to maintain state.
+        - name: code_challenge
+          in: query
+          required: false
+          schema:
+            type: string
+          example: CHALLENGE
+          description: PKCE code challenge.
+        - name: code_challenge_method
+          in: query
+          required: false
+          schema:
+            type: string
+          example: S256
+          description: PKCE challenge method (e.g., "S256").
+      responses:
+        '307':
+          description: Temporary redirect to tenant Identity authorization URL.
+          headers:
+            Location:
+              description: Redirect URL to Identity authorization endpoint.
+              schema:
+                type: string
+                format: uri
+              example: https://aigw-mgogax.data.aigw.integration-cyberark.cloud/OAuth2/Authorize?client_id=00000000-0000-0000-0000-000000000000&response_type=code&redirect_uri=https://example.com/callback&scope=full&state=STATE&code_challenge=CHALLENGE&code_challenge_method=S256
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiBasicError'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiBasicError'
+  /OAuth2/Token:
+    post:
+      tags: [OAuth2]
+      summary: OAuth2 token endpoint
+      description: >
+        Proxies token requests to the tenant-specific Identity token endpoint.
+        Request body must be form-encoded.
+      operationId: oauth2Token
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/OAuth2TokenRequest'
+            examples:
+              authorization_code:
+                summary: Authorization code exchange
+                value:
+                  grant_type: authorization_code
+                  client_id: 00000000-0000-0000-0000-000000000000
+                  client_secret: CLIENT_SECRET
+                  code: AUTH_CODE
+                  redirect_uri: https://example.com/callback
+                  scope: full
+      responses:
+        '200':
+          description: Token response proxied from Identity.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiBasicError'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiBasicError'
+  /.well-known/oauth-authorization-server:
+    get:
+      tags: [WellKnown]
+      summary: OAuth 2.0 authorization server metadata
+      description: Returns OAuth 2.0 authorization server metadata for the tenant.
+      operationId: authorizationServerMetadata
+      responses:
+        '200':
+          description: OAuth 2.0 authorization server metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthorizationServerMetadata'
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiBasicError'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiBasicError'
+  /.well-known/oauth-protected-resource:
+    get:
+      tags: [WellKnown]
+      summary: OAuth protected resource metadata
+      description: Returns the authorization server and resource identifier.
+      operationId: protectedResourceMetadata
+      responses:
+        '200':
+          description: OAuth protected resource metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthProtectedResourceResponse'
+              examples:
+                deep_wiki:
+                  summary: Deep Wiki MCP resource
+                  value:
+                    authorization_server: https://aigw-mgogax.data.aigw.integration-cyberark.cloud
+                    resource: https://aigw-mgogax.data.aigw.integration-cyberark.cloud/mcp/deep-wiki
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiBasicError'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiBasicError'
+  /mcp/deep-wiki:
+    post:
+      tags: [MCP]
+      summary: MCP gateway (deep-wiki)
+      description: MCP tools exposed by the Deep Wiki integration.
+      operationId: mcpDeepWiki
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+            examples:
+              tools_list:
+                summary: List tools
+                value:
+                  jsonrpc: "2.0"
+                  id: "1"
+                  method: tools/list
+                  params: {}
+      responses:
+        '200':
+          description: MCP JSON-RPC response.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiBasicError'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiBasicError'
+  /mcp/sia:
+    post:
+      tags: [MCP]
+      summary: MCP gateway (sia)
+      description: CyberArk MCP server for secure infrastructure access for databases.
+      operationId: mcpSia
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+            examples:
+              tools_list:
+                summary: List tools
+                value:
+                  jsonrpc: "2.0"
+                  id: "1"
+                  method: tools/list
+                  params: {}
+      responses:
+        '200':
+          description: MCP JSON-RPC response.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiBasicError'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiBasicError'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    clientId:
+      name: client_id
+      in: query
+      required: true
+      schema:
+        type: string
+        format: uuid
+      example: 00000000-0000-0000-0000-000000000000
+      description: OAuth2 client identifier (UUID).
+  schemas:
+    OAuth2TokenRequest:
+      type: object
+      required: [client_id, client_secret]
+      properties:
+        client_id:
+          type: string
+          format: uuid
+          description: OAuth2 client identifier.
+        client_secret:
+          type: string
+          description: OAuth2 client secret.
+        grant_type:
+          type: string
+          description: OAuth2 grant type.
+        code:
+          type: string
+          description: Authorization code for authorization_code flow.
+        redirect_uri:
+          type: string
+          format: uri
+          description: Redirect URI used in the authorization request.
+        scope:
+          type: string
+          description: Requested scope string.
+      additionalProperties: true
+    OAuthProtectedResourceResponse:
+      type: object
+      required: [authorization_server, resource]
+      properties:
+        authorization_server:
+          type: string
+          description: Base URL of the authorization server.
+        resource:
+          type: string
+          description: Protected resource identifier derived from authorization_server.
+      example:
+        authorization_server: https://aigw-mgogax.data.aigw.integration-cyberark.cloud
+        resource: https://aigw-mgogax.data.aigw.integration-cyberark.cloud/mcp/deep-wiki
+    AuthorizationServerMetadata:
+      type: object
+      required: [issuer, response_types_supported]
+      properties:
+        issuer:
+          type: string
+          format: uri
+          description: Authorization server issuer identifier.
+        response_types_supported:
+          type: array
+          items:
+            type: string
+        authorization_endpoint:
+          type: string
+          format: uri
+        token_endpoint:
+          type: string
+          format: uri
+        registration_endpoint:
+          type: string
+          format: uri
+        scopes_supported:
+          type: array
+          items:
+            type: string
+        response_modes_supported:
+          type: array
+          items:
+            type: string
+        grant_types_supported:
+          type: array
+          items:
+            type: string
+        token_endpoint_auth_methods_supported:
+          type: array
+          items:
+            type: string
+        token_endpoint_auth_signing_alg_values_supported:
+          type: array
+          items:
+            type: string
+        service_documentation:
+          type: string
+          format: uri
+        ui_locales_supported:
+          type: array
+          items:
+            type: string
+        op_policy_uri:
+          type: string
+          format: uri
+        op_tos_uri:
+          type: string
+          format: uri
+        revocation_endpoint:
+          type: string
+          format: uri
+        revocation_endpoint_auth_methods_supported:
+          type: array
+          items:
+            type: string
+        revocation_endpoint_auth_signing_alg_values_supported:
+          type: array
+          items:
+            type: string
+        introspection_endpoint:
+          type: string
+          format: uri
+        introspection_endpoint_auth_methods_supported:
+          type: array
+          items:
+            type: string
+        introspection_endpoint_auth_signing_alg_values_supported:
+          type: array
+          items:
+            type: string
+        code_challenge_methods_supported:
+          type: array
+          items:
+            type: string
+      additionalProperties: true
+      example:
+        issuer: https://aigw-mgogax.data.aigw.integration-cyberark.cloud/
+        authorization_endpoint: https://aigw-mgogax.data.aigw.integration-cyberark.cloud/OAuth2/Authorize
+        token_endpoint: https://aigw-mgogax.data.aigw.integration-cyberark.cloud/OAuth2/Token
+        registration_endpoint: https://aigw-mgogax.data.aigw.integration-cyberark.cloud/OAuth2/Register
+        scopes_supported:
+          - full
+        response_types_supported:
+          - code
+          - id_token
+          - id_token token
+          - code id_token
+          - code token
+          - code id_token token
+        response_modes_supported:
+          - query
+          - fragment
+        grant_types_supported:
+          - authorization_code
+        token_endpoint_auth_methods_supported:
+          - client_secret_basic
+        revocation_endpoint_auth_methods_supported:
+          - client_secret_basic
+        code_challenge_methods_supported:
+          - S256
+    ApiBasicError:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        description:
+          type: string
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field:
+                type: string
+              message:
+                type: string
