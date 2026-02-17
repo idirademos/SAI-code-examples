@@ -1,5 +1,6 @@
 # OAuth 2.1 and MCP Gateway – Documentation and Q&A
 
+
 This document describes the CyberArk AI Gateway **OAuth 2.1** endpoints and MCP (Model Context Protocol) gateway. **This project supports only OAuth 2.1.** Authentication uses the authorization code flow with **PKCE** and **client credentials** (client_id + client_secret); they do not conflict. It is intended for developers integrating custom agents or clients with the gateway. Content is based on this repository’s code and the OpenAPI spec.
 
 **How to use this doc:** Replace the example tenant host (`infycpc2024.data.aigw.cyberark.cloud`) with your own tenant base URL. Section 1 describes each endpoint; Section 4 provides copy-paste examples.
