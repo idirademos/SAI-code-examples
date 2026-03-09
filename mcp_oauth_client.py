@@ -7,17 +7,39 @@ Protocol) endpoint to list tools and optionally call one. Configuration is via
 environment variables (see .env.example).
 
 Environment variables:
-    TENANT_URL       Gateway base URL (e.g. https://aigw.example.cloud).
-    CLIENT_ID        OAuth client ID.
-    CLIENT_SECRET    OAuth client secret (used with PKCE on token request).
-    REDIRECT_URI      Callback URL (must be registered in CyberArk Identity).
-    MCP_PATH         MCP path (default: /mcp/deep-wiki).
-    SCOPE            OAuth scope (default: full).
-    SKIP_OAUTH       If "true", use ACCESS_TOKEN from env and skip OAuth.
-    ACCESS_TOKEN     Used when SKIP_OAUTH=true.
-    TOOL_NAME        Optional MCP tool to call.
-    TOOL_ARGS_JSON   Optional JSON object of arguments for the tool.
-    LIST_TOOLS       If "false", skip listing tools when TOOL_NAME is set (default: true, always list).
+    TENANT_URL           Gateway base URL (e.g. https://aigw.example.cloud).
+    CLIENT_ID            OAuth client ID.
+    CLIENT_SECRET        OAuth client secret (required unless OMIT_CLIENT_SECRET=true).
+    REDIRECT_URI         Callback URL (must be registered in CyberArk Identity).
+    OMIT_CLIENT_SECRET   If "true", omit client_secret from token request (public client experiment).
+    MODE                 If "public", omit client_secret from token request (alternative to OMIT_CLIENT_SECRET).
+    MCP_PATH             MCP path (default: /mcp/deep-wiki).
+    SCOPE                OAuth scope (default: full).
+    SKIP_OAUTH           If "true", use ACCESS_TOKEN from env and skip OAuth.
+    ACCESS_TOKEN         Used when SKIP_OAUTH=true.
+    TOOL_NAME            Optional MCP tool to call.
+    TOOL_ARGS_JSON       Optional JSON object of arguments for the tool.
+    LIST_TOOLS           If "false", skip listing tools when TOOL_NAME is set (default: true, always list).
+
+Run Instructions:
+    # Normal confidential client (baseline):
+    TENANT_URL=https://your-gateway.com
+    CLIENT_ID=your-client-id
+    CLIENT_SECRET=your-client-secret
+    REDIRECT_URI=http://localhost:3030/callback
+    SCOPE=full
+    python mcp_oauth_client.py
+
+    # Public client experiment (omit client_secret) - either way works:
+    TENANT_URL=https://your-gateway.com
+    CLIENT_ID=your-client-id
+    REDIRECT_URI=http://localhost:3030/callback
+    SCOPE=full
+    OMIT_CLIENT_SECRET=true
+    python mcp_oauth_client.py
+
+    # OR alternatively:
+    MODE=public python mcp_oauth_client.py
 
 Usage:
     Copy .env.example to .env, set the variables, then:
@@ -245,6 +267,18 @@ def generate_pkce_pair() -> Tuple[str, str]:
     return code_verifier, code_challenge
 
 
+def _is_loopback_uri(redirect_uri: str) -> bool:
+    """Return True if redirect_uri points to a loopback address (localhost, 127.x, [::1])."""
+    host = urlparse(redirect_uri).hostname or ""
+    if host in ("localhost", "127.0.0.1", "::1"):
+        return True
+    try:
+        import ipaddress
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def normalize_base_url(tenant_url: str) -> str:
     """Normalize the tenant URL for use in OAuth and MCP requests.
 
@@ -275,6 +309,7 @@ def build_authorize_url(
     scope: str,
     code_challenge: str,
     state: str,
+    endpoint_suffix: str = "",
 ) -> str:
     """Build the OAuth 2.1 authorization URL (authorization code + PKCE).
 
@@ -288,6 +323,7 @@ def build_authorize_url(
         scope: Scope string (e.g. "full").
         code_challenge: PKCE code challenge (S256).
         state: CSRF state value.
+        endpoint_suffix: Optional suffix appended to the Authorize path (e.g. "-AGAI-1148" for branch stacks).
 
     Returns:
         Full URL to the /OAuth2/Authorize endpoint with query parameters.
@@ -301,7 +337,7 @@ def build_authorize_url(
         "code_challenge_method": "S256",
         "state": state,
     }
-    return f"{base_url}/OAuth2/Authorize?{urlencode(params)}"
+    return f"{base_url}/OAuth2/Authorize{endpoint_suffix}?{urlencode(params)}"
 
 
 class CallbackHandler(BaseHTTPRequestHandler):
@@ -312,16 +348,30 @@ class CallbackHandler(BaseHTTPRequestHandler):
         super().__init__(*args, **kwargs)
 
     def do_GET(self):  # noqa: N802
-        params = parse_qs(urlparse(self.path).query)
+        parsed_url = urlparse(self.path)
+        params = parse_qs(parsed_url.query)
+
+        # Print callback details
+        print(f"\n🔄 OAUTH CALLBACK RECEIVED:")
+        print(f"GET {self.path}")
+        print(f"Query params: {dict(params)}")
+
         if "code" in params:
             self.callback_data["code"] = params["code"][0]
+            print(f"✅ Authorization code captured: {params['code'][0][:20]}...")
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.end_headers()
             self.wfile.write(b"Authorization complete. You can close this window.")
         else:
+            print("❌ No authorization code in callback")
+            if "error" in params:
+                print(f"Error: {params['error']}")
+            if "error_description" in params:
+                print(f"Error description: {params['error_description']}")
             self.send_response(400)
             self.end_headers()
+        print()  # Extra newline for readability
 
     def log_message(self, format: str, *args) -> None:  # noqa: A002
         return
@@ -367,20 +417,22 @@ class CallbackServer:
 def exchange_code_for_token(
     base_url: str,
     client_id: str,
-    client_secret: str,
+    client_secret: str | None,
     code: str,
     redirect_uri: str,
     code_verifier: str,
+    endpoint_suffix: str = "",
 ) -> Dict[str, str]:
-    """Exchange the authorization code for an access token (OAuth 2.1 PKCE + client credentials).
+    """Exchange the authorization code for an access token (OAuth 2.1 PKCE + optional client credentials).
 
     POSTs to the gateway token endpoint with grant_type=authorization_code,
-    code_verifier (PKCE), and client_secret. PKCE and client credentials do not conflict.
+    code_verifier (PKCE), and optionally client_secret. If client_secret is None,
+    omits it (public client). If provided, includes it (confidential client).
 
     Args:
         base_url: Gateway base URL (no trailing slash).
         client_id: OAuth client identifier.
-        client_secret: OAuth client secret.
+        client_secret: OAuth client secret (None for public clients).
         code: Authorization code from the redirect callback.
         redirect_uri: Same redirect_uri used in the authorize request.
         code_verifier: PKCE code verifier that matches the code_challenge sent at authorize.
@@ -391,21 +443,76 @@ def exchange_code_for_token(
     Raises:
         requests.HTTPError: On non-2xx response from the token endpoint.
     """
+    data = {
+        "grant_type": "authorization_code",
+        "client_id": client_id,
+        "code": code,
+        "redirect_uri": redirect_uri,
+        "code_verifier": code_verifier,
+        "scope": "full",
+    }
+    if client_secret is not None:
+        data["client_secret"] = client_secret
+
+    token_url = f"{base_url}/OAuth2/Token{endpoint_suffix}"
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+    # Print request details
+    print(f"\n🔍 TOKEN REQUEST:")
+    print(f"POST {token_url}")
+    print(f"Headers: {headers}")
+
+    # Show exact POST field names (never show secret values)
+    field_names = list(data.keys())
+    print(f"📦 POST Fields: {field_names}")
+
+    # Highlight PKCE and client authentication
+    pkce_status = f"✅ PKCE: code_verifier present"
+    auth_status = "✅ Client Auth: client_secret included" if client_secret else "❌ Client Auth: NO client_secret (public client experiment)"
+
+    print(f"🔐 Authentication Method:")
+    print(f"   {pkce_status}")
+    print(f"   {auth_status}")
+
+    # Show summary without sensitive values
+    summary = {k: "***" if k == "client_secret" else "present" for k in data.keys()}
+    print(f"📋 Field Summary: {summary}")
+
     response = requests.post(
-        f"{base_url}/OAuth2/Token",
-        data={
-            "grant_type": "authorization_code",
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "code": code,
-            "redirect_uri": redirect_uri,
-            "code_verifier": code_verifier,
-            "scope": "full",
-        },
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        token_url,
+        data=data,
+        headers=headers,
         timeout=30,
     )
-    response.raise_for_status()
+
+    # Print response details
+    print(f"\n📨 TOKEN RESPONSE:")
+    print(f"Status: {response.status_code} {response.reason}")
+    print(f"Headers: {dict(response.headers)}")
+    try:
+        response_json = response.json()
+        print(f"Body: {response_json}")
+    except Exception:
+        print(f"Body (raw): {response.text}")
+    print()  # Extra newline for readability
+
+    # Return results for both success and failure cases
+    result = {
+        "status_code": response.status_code,
+        "success": response.status_code == 200,
+        "response": response.json() if response.headers.get('content-type', '').startswith('application/json') else response.text
+    }
+
+    if not result["success"]:
+        # Print summary but don't crash - let caller handle
+        error_desc = "server-side schema enforcement" if response.status_code == 422 else f"HTTP {response.status_code} error"
+        print(f"❌ Token request failed: {error_desc}")
+        if response.status_code == 422 and isinstance(result["response"], dict):
+            errors = result["response"].get("errors", [])
+            if any(err.get("field") == "client_secret" for err in errors):
+                print("   CyberArk Identity requires client_secret field (does not support public clients)")
+
+    response.raise_for_status()  # Still raise for proper error handling
     return response.json()
 
 
@@ -431,6 +538,12 @@ async def connect_mcp(base_url: str, mcp_path: str, access_token: str) -> None:
             tool_args = json.loads(tool_args_raw)
         except json.JSONDecodeError as exc:
             raise ValueError(f"Invalid TOOL_ARGS_JSON: {exc}") from exc
+
+    # Print MCP connection details
+    print(f"\n🔗 MCP CONNECTION:")
+    print(f"URL: {mcp_url}")
+    print(f"Authorization: Bearer {access_token[:20]}...{access_token[-10:]}")
+    print()
 
     try:
         timings: list[tuple[str, str]] = []
@@ -471,9 +584,10 @@ async def connect_mcp(base_url: str, mcp_path: str, access_token: str) -> None:
 
 
 def get_env_or_exit() -> Tuple[str, str, str, str, str]:
-    """Load required environment variables for OAuth 2.1 (PKCE + client credentials) and MCP; exit if missing.
+    """Load required environment variables for OAuth 2.1 and MCP; exit if missing.
 
-    When SKIP_OAUTH is not set, requires TENANT_URL, CLIENT_ID, CLIENT_SECRET, and REDIRECT_URI.
+    When SKIP_OAUTH is not set, requires TENANT_URL, CLIENT_ID, and REDIRECT_URI.
+    CLIENT_SECRET is required unless OMIT_CLIENT_SECRET=true or MODE=public.
     MCP_PATH defaults to DEFAULT_MCP_PATH if unset.
 
     Returns:
@@ -494,7 +608,12 @@ def get_env_or_exit() -> Tuple[str, str, str, str, str]:
             _exit_missing(["TENANT_URL"])
         return tenant_url, client_id, client_secret, redirect_uri, mcp_path
 
-    required = [("TENANT_URL", tenant_url), ("CLIENT_ID", client_id), ("CLIENT_SECRET", client_secret), ("REDIRECT_URI", redirect_uri)]
+    required = [("TENANT_URL", tenant_url), ("CLIENT_ID", client_id), ("REDIRECT_URI", redirect_uri)]
+    # CLIENT_SECRET is optional only when OMIT_CLIENT_SECRET=true or MODE=public
+    omit_secret = (os.getenv("OMIT_CLIENT_SECRET", "").lower() == "true" or
+                   os.getenv("MODE", "").lower() == "public")
+    if not omit_secret and not client_secret:
+        required.append(("CLIENT_SECRET", client_secret))
     missing = [name for name, value in required if not value]
     if missing:
         _exit_missing(missing)
@@ -512,6 +631,23 @@ async def main() -> None:
     tenant_url, client_id, client_secret, redirect_uri, mcp_path = get_env_or_exit()
     base_url = normalize_base_url(tenant_url)
     scope = os.getenv("SCOPE", "full")
+    endpoint_suffix = os.getenv("OAUTH_ENDPOINT_SUFFIX", "").strip()
+
+    # Show current mode - support both OMIT_CLIENT_SECRET=true and MODE=public
+    omit_secret = (os.getenv("OMIT_CLIENT_SECRET", "").lower() == "true" or
+                   os.getenv("MODE", "").lower() == "public")
+    if omit_secret:
+        print(f"\n🔧 Mode: PUBLIC-CLIENT EXPERIMENT (client_secret omitted)")
+        print("   • Will omit client_secret from token request")
+        print("   • Testing CyberArk Identity public client support")
+    else:
+        print(f"\n🔧 Mode: CONFIDENTIAL (client_secret included)")
+        print("   • Will include client_secret in token request")
+        print("   • Standard confidential client flow")
+    print(f"   • Client ID: {client_id}")
+    print(f"   • Base URL: {base_url}")
+    print(f"   • Scope: {scope}")
+    print(f"   • Token endpoint: {base_url}/OAuth2/Token{endpoint_suffix}")
 
     if os.getenv("SKIP_OAUTH", "").lower() == "true":
         _step("Using ACCESS_TOKEN from .env")
@@ -519,23 +655,69 @@ async def main() -> None:
     else:
         code_verifier, code_challenge = generate_pkce_pair()
         state = secrets.token_urlsafe(16)
-        callback_server = CallbackServer(redirect_uri)
-        callback_server.start()
-        auth_url = build_authorize_url(base_url, client_id, redirect_uri, scope, code_challenge, state)
-        _step("Open this URL to authorize")
-        print(auth_url)
-        try:
-            webbrowser.open(auth_url)
-        except Exception:
-            pass
-        try:
-            _step("Waiting for authorization callback")
-            code = callback_server.wait_for_code()
-        finally:
-            callback_server.stop()
-        _step("Exchanging code for access token (OAuth 2.1 PKCE + client credentials)")
+        auth_url = build_authorize_url(base_url, client_id, redirect_uri, scope, code_challenge, state, endpoint_suffix)
+        loopback = _is_loopback_uri(redirect_uri)
+
+        # Show PKCE pair generation
+        print(f"\n🔑 PKCE Generated:")
+        print(f"   code_verifier:  {code_verifier[:20]}...")
+        print(f"   code_challenge: {code_challenge[:20]}... (SHA256)")
+        print(f"   method: S256")
+
+        if loopback:
+            # Loopback: start local callback server to capture the code automatically
+            callback_server = CallbackServer(redirect_uri)
+            callback_server.start()
+            _step("Open this URL to authorize")
+            print(auth_url)
+            try:
+                webbrowser.open(auth_url)
+            except Exception:
+                pass
+            try:
+                _step("Waiting for authorization callback")
+                code = callback_server.wait_for_code()
+            finally:
+                callback_server.stop()
+        else:
+            # Non-loopback (e.g. https://jojo.com): manual mode — no local server
+            _step("Non-loopback redirect URI — manual mode")
+            print(f"Redirect URI ({redirect_uri}) is not a loopback address.")
+            print("No local callback server will be started.\n")
+            _step("Open this URL to authorize")
+            print(auth_url)
+            try:
+                webbrowser.open(auth_url)
+            except Exception:
+                pass
+            print("\nAfter login, your browser will redirect to:")
+            print(f"  {redirect_uri}?code=<AUTH_CODE>&state={state}")
+            print("\nCopy the 'code' value from the redirect URL and paste it below.")
+            print("(If the redirect target is unreachable, copy the code from the browser address bar.)\n")
+            code = input("Authorization code: ").strip()
+            if not code:
+                print("No code provided. Exiting.")
+                sys.exit(1)
+
+        omit_secret = (os.getenv("OMIT_CLIENT_SECRET", "").lower() == "true" or
+                       os.getenv("MODE", "").lower() == "public")
+        client_secret_to_use = None if omit_secret else client_secret
+
+        # PKCE enforcement test: deliberately send wrong code_verifier
+        tamper_pkce = os.getenv("TAMPER_PKCE", "").lower() == "true"
+        if tamper_pkce:
+            import secrets as _secrets
+            wrong_verifier = _secrets.token_urlsafe(32)
+            print(f"\n⚠️  TAMPER_PKCE=true: replacing code_verifier with a random wrong value")
+            print(f"   correct verifier: {code_verifier[:20]}...")
+            print(f"   wrong   verifier: {wrong_verifier[:20]}...")
+            print(f"   Expected result: Identity should REJECT with invalid_grant or similar")
+            code_verifier = wrong_verifier
+
+        mode_desc = "PKCE only (public client experiment)" if omit_secret else "PKCE + client credentials"
+        _step(f"Exchanging code for access token (OAuth 2.1 {mode_desc})")
         t0 = time.perf_counter()
-        token = exchange_code_for_token(base_url, client_id, client_secret, code, redirect_uri, code_verifier)
+        token = exchange_code_for_token(base_url, client_id, client_secret_to_use, code, redirect_uri, code_verifier, endpoint_suffix)
         elapsed = time.perf_counter() - t0
         access_token = token.get("access_token")
         if not access_token:
