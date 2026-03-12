@@ -310,6 +310,7 @@ def build_authorize_url(
     code_challenge: str,
     state: str,
     endpoint_suffix: str = "",
+    path_prefix: str = "",
 ) -> str:
     """Build the OAuth 2.1 authorization URL (authorization code + PKCE).
 
@@ -324,6 +325,7 @@ def build_authorize_url(
         code_challenge: PKCE code challenge (S256).
         state: CSRF state value.
         endpoint_suffix: Optional suffix appended to the Authorize path (e.g. "-AGAI-1148" for branch stacks).
+        path_prefix: Optional path prefix before /OAuth2 (e.g. "/api" for the new IdP bridge).
 
     Returns:
         Full URL to the /OAuth2/Authorize endpoint with query parameters.
@@ -337,7 +339,7 @@ def build_authorize_url(
         "code_challenge_method": "S256",
         "state": state,
     }
-    return f"{base_url}/OAuth2/Authorize{endpoint_suffix}?{urlencode(params)}"
+    return f"{base_url}{path_prefix}/OAuth2/Authorize{endpoint_suffix}?{urlencode(params)}"
 
 
 class CallbackHandler(BaseHTTPRequestHandler):
@@ -422,6 +424,7 @@ def exchange_code_for_token(
     redirect_uri: str,
     code_verifier: str,
     endpoint_suffix: str = "",
+    path_prefix: str = "",
 ) -> Dict[str, str]:
     """Exchange the authorization code for an access token (OAuth 2.1 PKCE + optional client credentials).
 
@@ -436,6 +439,7 @@ def exchange_code_for_token(
         code: Authorization code from the redirect callback.
         redirect_uri: Same redirect_uri used in the authorize request.
         code_verifier: PKCE code verifier that matches the code_challenge sent at authorize.
+        path_prefix: Optional path prefix before /OAuth2 (e.g. "/api" for the new IdP bridge).
 
     Returns:
         Token response JSON (e.g. access_token, expires_in, refresh_token).
@@ -454,7 +458,7 @@ def exchange_code_for_token(
     if client_secret is not None:
         data["client_secret"] = client_secret
 
-    token_url = f"{base_url}/OAuth2/Token{endpoint_suffix}"
+    token_url = f"{base_url}{path_prefix}/OAuth2/Token{endpoint_suffix}"
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
 
     # Print request details
@@ -633,6 +637,17 @@ async def main() -> None:
     scope = os.getenv("SCOPE", "full")
     endpoint_suffix = os.getenv("OAUTH_ENDPOINT_SUFFIX", "").strip()
 
+    # New IdP bridge: port 8443 + /api path prefix
+    test_new_idp = os.getenv("TEST_NEW_IDP", "").lower() == "true"
+    if test_new_idp:
+        from urllib.parse import urlparse, urlunparse
+        _parsed = urlparse(base_url)
+        oauth_base_url = urlunparse(_parsed._replace(netloc=f"{_parsed.hostname}:8443"))
+        oauth_path_prefix = "/api"
+    else:
+        oauth_base_url = base_url
+        oauth_path_prefix = ""
+
     # Show current mode - support both OMIT_CLIENT_SECRET=true and MODE=public
     omit_secret = (os.getenv("OMIT_CLIENT_SECRET", "").lower() == "true" or
                    os.getenv("MODE", "").lower() == "public")
@@ -647,7 +662,9 @@ async def main() -> None:
     print(f"   • Client ID: {client_id}")
     print(f"   • Base URL: {base_url}")
     print(f"   • Scope: {scope}")
-    print(f"   • Token endpoint: {base_url}/OAuth2/Token{endpoint_suffix}")
+    idp_label = "new IdP bridge (:8443/api)" if test_new_idp else "original IdP bridge"
+    print(f"   • IdP bridge: {idp_label}")
+    print(f"   • Token endpoint: {oauth_base_url}{oauth_path_prefix}/OAuth2/Token{endpoint_suffix}")
 
     if os.getenv("SKIP_OAUTH", "").lower() == "true":
         _step("Using ACCESS_TOKEN from .env")
@@ -655,7 +672,7 @@ async def main() -> None:
     else:
         code_verifier, code_challenge = generate_pkce_pair()
         state = secrets.token_urlsafe(16)
-        auth_url = build_authorize_url(base_url, client_id, redirect_uri, scope, code_challenge, state, endpoint_suffix)
+        auth_url = build_authorize_url(oauth_base_url, client_id, redirect_uri, scope, code_challenge, state, endpoint_suffix, oauth_path_prefix)
         loopback = _is_loopback_uri(redirect_uri)
 
         # Show PKCE pair generation
@@ -717,7 +734,7 @@ async def main() -> None:
         mode_desc = "PKCE only (public client experiment)" if omit_secret else "PKCE + client credentials"
         _step(f"Exchanging code for access token (OAuth 2.1 {mode_desc})")
         t0 = time.perf_counter()
-        token = exchange_code_for_token(base_url, client_id, client_secret_to_use, code, redirect_uri, code_verifier, endpoint_suffix)
+        token = exchange_code_for_token(oauth_base_url, client_id, client_secret_to_use, code, redirect_uri, code_verifier, endpoint_suffix, oauth_path_prefix)
         elapsed = time.perf_counter() - t0
         access_token = token.get("access_token")
         if not access_token:
