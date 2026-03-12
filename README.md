@@ -7,7 +7,7 @@ This project provides **code examples and reference material** for integrating w
 - **Authenticate** via **OAuth 2.1** (authorization code flow with **PKCE** and **client credentials**) against the gateway and CyberArk Identity.
 - **Call MCP Server (Model Context Protocol)** endpoints—such as **deep-wiki** and **SIA** (Secure Infrastructure Access)—using a Bearer token.
 
-**This project supports only OAuth 2.1.** Authentication uses the authorization code flow with **PKCE** (code_challenge/code_verifier) and **client_id** + **client_secret** on the token request; PKCE and client credentials are used together and do not conflict.
+**This project supports only OAuth 2.1.** The primary flow uses the authorization code flow with **PKCE** (code_challenge/code_verifier) and **client_id** + **client_secret** on the token request. It also includes experimental modes for testing public client support (PKCE without client_secret) and PKCE enforcement validation (deliberate code_verifier tampering).
 
 The examples are intended for developers building agents, IDEs, or tools that need to use the gateway’s OAuth 2.1 and MCP APIs. Use them as a starting point for your own clients and automation.
 
@@ -17,7 +17,7 @@ The examples are intended for developers building agents, IDEs, or tools that ne
 |----------------|-------------|
 | **`mcp_oauth_client.py`** | Main Python script. Runs the OAuth 2.1 authorization code flow with PKCE and client credentials (browser, callback server, code exchange with `code_verifier` and `client_secret`), then connects to the MCP gateway to initialize, list tools, and optionally call a tool. |
 | **`openapi.yaml`** | OpenAPI 3.1 specification for the Agents Service IdP Bridge (OAuth and `.well-known` endpoints). |
-| **`.env.example`** | Template for environment variables. Copy to `.env` and set `TENANT_URL`, `CLIENT_ID`, `CLIENT_SECRET`, `REDIRECT_URI`, and optional `TOOL_NAME`, `TOOL_ARGS_JSON`, `LIST_TOOLS`, `SKIP_OAUTH`, `ACCESS_TOKEN`. OAuth 2.1 with PKCE + client credentials. |
+| **`.env.example`** | Template for environment variables. Copy to `.env` and set `TENANT_URL`, `CLIENT_ID`, `CLIENT_SECRET`, `REDIRECT_URI`, and optional `TOOL_NAME`, `TOOL_ARGS_JSON`, `LIST_TOOLS`, `SKIP_OAUTH`, `ACCESS_TOKEN`, `OMIT_CLIENT_SECRET`, `MODE`, `OAUTH_ENDPOINT_SUFFIX`, `TAMPER_PKCE`. |
 | **`.env`** | Local configuration (not committed). Holds tenant URL, OAuth credentials, redirect URI, and other options. |
 | **`README.md`** | This file. Setup, agent registration, redirect URI configuration, troubleshooting, and a short OAuth 2.1 + MCP reference. |
 | **`pyproject.toml`** | Project metadata and dependencies for the Python package (e.g. when using `uv` or `pip install -e .`). |
@@ -98,6 +98,18 @@ python mcp_oauth_client.py
 
 To bypass OAuth and use an existing token, set `SKIP_OAUTH=true` and `ACCESS_TOKEN=...` in `.env`.
 
+### Run modes
+
+The script supports several run modes via environment variables:
+
+| Mode | How to enable | What it does |
+|------|---------------|--------------|
+| **Confidential client** (default) | `CLIENT_SECRET=...` in `.env` | Standard flow — sends `client_id` + `client_secret` + PKCE `code_verifier` in the token request. |
+| **Public client experiment** | `OMIT_CLIENT_SECRET=true` or `MODE=public` | Omits `client_secret` from the token request. Tests whether CyberArk Identity accepts PKCE-only (no secret) token exchanges. |
+| **PKCE enforcement test** | `TAMPER_PKCE=true` | Deliberately replaces the correct `code_verifier` with a random wrong value before the token request. Verifies that Identity correctly rejects a tampered verifier with `invalid_grant`. |
+| **Skip OAuth** | `SKIP_OAUTH=true` + `ACCESS_TOKEN=...` | Skips the browser flow and uses a pre-existing Bearer token directly. |
+| **Branch stack** | `OAUTH_ENDPOINT_SUFFIX=-<suffix>` | Appends a suffix to the Authorize and Token endpoint paths (e.g. `/OAuth2/Authorize-AGAI-1148`). Used for testing feature-branch deployments. |
+
 ### How to create an AI agent (Secure AI)
 
 To use this client with the CyberArk AI Gateway, register an AI agent and obtain client credentials:
@@ -139,6 +151,8 @@ Use the same redirect URI in `.env` and in Identity (same scheme, host, port, an
 - **504 Gateway Time-out** — The gateway (or the MCP backend behind it) did not respond within its timeout. Common causes: the tool is slow (e.g. AI-backed tools), the gateway’s timeout is too short, or the backend is overloaded. Try again, use a faster/simpler tool, or ask the gateway admin to raise timeouts.
 - **Invalid params / missing properties** — The tool requires arguments. Set `TOOL_ARGS_JSON` in `.env` with the required keys (see `.env.example` for examples).
 - **401 Unauthorized** — Token expired or invalid. Run the OAuth flow again (without `SKIP_OAUTH`) to get a new token.
+- **403 on the Authorize URL (CloudFront WAF)** — The CloudFront WAF rule `EC2MetaDataSSRF_QUERYARGUMENTS` can block the authorize request when `redirect_uri` contains `localhost` or `127.0.0.1`. This fires before reaching the IdP bridge. Fixed by adding SSRF exclusions to the ALB WAF CDK construct (`alb_waf_construct.py`) and redeploying across all environments.
+- **422 on the token request (IdP bridge schema validation)** — The IdP bridge enforces `client_secret` as a required field before forwarding to CyberArk Identity. If running with `OMIT_CLIENT_SECRET=true`, the bridge rejects the request with a 422 schema error before Identity is reached. This means the public client experiment is blocked at the bridge layer, not Identity.
 
 ---
 
@@ -185,12 +199,22 @@ Examples
 Authorize URL (OAuth 2.1 PKCE: include code_challenge, code_challenge_method=S256, state):
 <tenant-url>/OAuth2/Authorize?client_id=<CLIENT_ID>&response_type=code&redirect_uri=<REDIRECT_URI>&scope=full&code_challenge=<CODE_CHALLENGE>&code_challenge_method=S256&state=<STATE>
 
-Token (authorization_code with PKCE + client credentials):
+Token (authorization_code with PKCE + client credentials — confidential client):
 curl -X POST "<tenant-url>/OAuth2/Token" \
   -H "Content-Type: application/x-www-form-urlencoded" \
   --data-urlencode "grant_type=authorization_code" \
   --data-urlencode "client_id=<CLIENT_ID>" \
   --data-urlencode "client_secret=<CLIENT_SECRET>" \
+  --data-urlencode "code=<AUTH_CODE>" \
+  --data-urlencode "redirect_uri=<REDIRECT_URI>" \
+  --data-urlencode "code_verifier=<CODE_VERIFIER>" \
+  --data-urlencode "scope=full"
+
+Token (authorization_code with PKCE only — public client experiment, omit client_secret):
+curl -X POST "<tenant-url>/OAuth2/Token" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "grant_type=authorization_code" \
+  --data-urlencode "client_id=<CLIENT_ID>" \
   --data-urlencode "code=<AUTH_CODE>" \
   --data-urlencode "redirect_uri=<REDIRECT_URI>" \
   --data-urlencode "code_verifier=<CODE_VERIFIER>" \
