@@ -1,3 +1,4 @@
 .env
 sai_code_examples.egg-info/*
 .venv/*
+__pycache__/**

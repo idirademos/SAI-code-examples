@@ -31,6 +31,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import secrets
 import sys
 import threading
@@ -40,15 +41,57 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, Tuple
 from urllib.parse import parse_qs, urlencode, urlparse
 
+import httpx
 import requests
 from dotenv import load_dotenv
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 from tabulate import tabulate
 
-# Default MCP path and callback wait timeout (seconds)
-DEFAULT_MCP_PATH = "/mcp/deep-wiki"
+# Callback wait timeout (seconds). The MCP path comes from the MCP_PATH env var.
 CALLBACK_TIMEOUT = 300
+
+
+def _verify_tls() -> bool:
+    """Whether to verify TLS certs. Set INSECURE_SKIP_VERIFY=true to disable.
+
+    WARNING: disabling verification is for dev/integration environments with
+    self-signed certs only. Never use it with production credentials.
+    """
+    skip = os.getenv("INSECURE_SKIP_VERIFY", "").lower() == "true"
+    if skip:
+        # Silence the per-request InsecureRequestWarning from urllib3.
+        from urllib3.exceptions import InsecureRequestWarning
+
+        requests.packages.urllib3.disable_warnings(InsecureRequestWarning)  # type: ignore[attr-defined]
+    return not skip
+
+
+def _mcp_http_client_factory(
+    headers: Dict[str, str] | None = None,
+    timeout: httpx.Timeout | None = None,
+    auth: httpx.Auth | None = None,
+) -> httpx.AsyncClient:
+    """MCP httpx client factory that honors INSECURE_SKIP_VERIFY.
+
+    Mirrors mcp.shared._httpx_utils.create_mcp_http_client defaults, adding
+    verify=False when TLS verification is disabled.
+    """
+    from mcp.shared._httpx_utils import (
+        MCP_DEFAULT_SSE_READ_TIMEOUT,
+        MCP_DEFAULT_TIMEOUT,
+    )
+
+    kwargs: Dict[str, Any] = {"follow_redirects": True, "verify": _verify_tls()}
+    if timeout is None:
+        kwargs["timeout"] = httpx.Timeout(MCP_DEFAULT_TIMEOUT, read=MCP_DEFAULT_SSE_READ_TIMEOUT)
+    else:
+        kwargs["timeout"] = timeout
+    if headers is not None:
+        kwargs["headers"] = headers
+    if auth is not None:
+        kwargs["auth"] = auth
+    return httpx.AsyncClient(**kwargs)
 
 
 def _step(msg: str) -> None:
@@ -106,6 +149,59 @@ def _format_duration(seconds: float) -> str:
     return f"{seconds * 1000:.0f} ms"
 
 
+def _decode_jwt_segment(segment: str) -> dict[str, Any]:
+    """Base64url-decode a single JWT segment (header or payload) into a dict."""
+    padded = segment + "=" * (-len(segment) % 4)
+    return json.loads(base64.urlsafe_b64decode(padded.encode()))
+
+
+def _print_token_details(access_token: str) -> None:
+    """Print the full access token and, if it is a JWT, its decoded claims.
+
+    Helps diagnose why a token is rejected: check aud (audience/resource),
+    scope, iss (issuer), and exp (expiry) against what the MCP resource expects.
+    """
+    print(f"Access token (full):\n{access_token}\n")
+    parts = access_token.split(".")
+    if len(parts) != 3:
+        print("Token is not a JWT (opaque token) — cannot decode claims locally.")
+        return
+    try:
+        header = _decode_jwt_segment(parts[0])
+        payload = _decode_jwt_segment(parts[1])
+    except Exception as exc:  # noqa: BLE001
+        print(f"Could not decode JWT: {exc}")
+        return
+    print("JWT header:")
+    print(json.dumps(header, indent=2, sort_keys=True))
+    print("JWT claims:")
+    print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+
+    # Show the claims most relevant to whether the resource will accept the token.
+    rows: list[tuple[str, str]] = []
+    for claim in ("iss", "aud", "scope", "scp", "sub", "client_id", "azp", "agent_name"):
+        if claim in payload:
+            rows.append((claim, str(payload[claim])))
+
+    # Verdict: locally we can only check structure + expiry (signature needs the
+    # issuer's JWKS). Report expiry explicitly and note the limits of a local check.
+    exp = payload.get("exp")
+    expired = False
+    if isinstance(exp, (int, float)):
+        remaining = exp - time.time()
+        expired = remaining < 0
+        rows.append(("exp", f"{'EXPIRED ' + format(abs(remaining), '.0f') + 's ago' if expired else 'valid for ' + format(remaining, '.0f') + 's'}"))
+    else:
+        rows.append(("exp", "not present"))
+
+    if expired:
+        verdict = "INVALID — token has expired; run the OAuth flow again."
+    else:
+        verdict = "VALID (structurally): well-formed JWT, not expired. NOTE: signature/audience not verified locally — only the gateway can fully validate."
+    rows.append(("Token verdict", verdict))
+    print("\n" + tabulate(rows, headers=["Claim", "Value"], tablefmt="grid"))
+
+
 def _unwrap_exception(exc: BaseException) -> BaseException:
     """Recursively get the leaf exception from ExceptionGroups (e.g. from anyio TaskGroup)."""
     while getattr(exc, "exceptions", None) and len(exc.exceptions) > 0:
@@ -117,7 +213,25 @@ def _print_mcp_error(detail: BaseException, mcp_url: str) -> None:
     """Print a clear, user-friendly MCP error summary with suggested actions."""
     msg = str(detail).strip()
     rows = [("Error", msg)]
-    if "504" in msg or "Gateway Time-out" in msg or "timeout" in msg.lower():
+
+    # Surface the HTTP response body — gateways put policy-denial reasons there.
+    response = getattr(detail, "response", None)
+    body = ""
+    if response is not None:
+        try:
+            body = (response.text or "").strip()
+        except Exception:
+            body = ""
+    if body:
+        rows.append(("Response body", body[:2000]))
+
+    if "503" in msg or "Service Unavailable" in msg:
+        rows += [("Why", "The gateway rejected the request before reaching the upstream MCP service. "
+                          "On an AI gateway this is often a policy denial (route/tool not enabled, "
+                          "entitlement or quota) rather than the backend being down."),
+                 ("Try", "Read the response body above for the reason. Confirm with the gateway admin "
+                         "that MCP_PATH is enabled for this client and that no guardrail/quota is blocking it.")]
+    elif "504" in msg or "Gateway Time-out" in msg or "timeout" in msg.lower():
         rows += [("Why", "The gateway or upstream server did not respond in time."),
                  ("Try", "Run again, use a simpler tool, or ask the gateway admin to increase timeouts.")]
     elif "invalid params" in msg or "missing properties" in msg:
@@ -129,6 +243,67 @@ def _print_mcp_error(detail: BaseException, mcp_url: str) -> None:
     else:
         rows.append(("Try", "Check the gateway is reachable and your token is valid."))
     print("\n" + tabulate(rows, tablefmt="grid") + "\n")
+
+
+def probe_mcp_raw(mcp_url: str, access_token: str) -> None:
+    """Send a raw authenticated MCP 'initialize' POST and print the gateway's reply.
+
+    The MCP client library raises on non-2xx and discards the httpx response, so
+    policy/routing details in the body are lost. This bypasses it to show the
+    exact status, headers, and body the gateway returns.
+    """
+    _step("Raw gateway response probe")
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "mcp-oauth-client-probe", "version": "1.0"},
+        },
+    }
+    try:
+        resp = httpx.post(
+            mcp_url,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+                "Mcp-Protocol-Version": "2025-06-18",
+            },
+            json=payload,
+            timeout=30,
+            verify=_verify_tls(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"Raw probe request failed: {type(exc).__name__}: {exc}")
+        return
+    body_text = (resp.text or "").strip()
+    content_type = resp.headers.get("content-type", "")
+    if "html" in content_type.lower():
+        # Gateway returned an HTML error page — extract title + visible text,
+        # dropping <style>/<script> and tags so the actual message shows.
+        cleaned = re.sub(r"(?is)<(script|style).*?</\1>", " ", body_text)
+        title_match = re.search(r"(?is)<title>(.*?)</title>", cleaned)
+        visible = re.sub(r"(?s)<[^>]+>", " ", cleaned)
+        visible = re.sub(r"\s+", " ", visible).strip()
+        display_body = ""
+        if title_match:
+            display_body = f"[title] {title_match.group(1).strip()}\n"
+        display_body += visible[:1000]
+    else:
+        display_body = body_text[:2000] or "(empty)"
+    rows = [
+        ("HTTP status", f"{resp.status_code} {resp.reason_phrase}"),
+        ("Content-Type", content_type or "(none)"),
+        ("Response body", display_body or "(empty)"),
+    ]
+    interesting = ("www-authenticate", "content-type", "x-request-id", "x-amzn-requestid", "x-envoy-upstream-service-time", "server")
+    for key in interesting:
+        if key in resp.headers:
+            rows.append((f"header: {key}", resp.headers[key]))
+    print(tabulate(rows, tablefmt="grid"))
 
 
 def _flatten_key_value(obj: Any, prefix: str = "") -> list[tuple[str, str]]:
@@ -404,6 +579,7 @@ def exchange_code_for_token(
         },
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         timeout=30,
+        verify=_verify_tls(),
     )
     response.raise_for_status()
     return response.json()
@@ -434,7 +610,9 @@ async def connect_mcp(base_url: str, mcp_path: str, access_token: str) -> None:
 
     try:
         timings: list[tuple[str, str]] = []
-        async with streamablehttp_client(url=mcp_url, headers=headers) as (read_stream, write_stream, _):
+        async with streamablehttp_client(
+            url=mcp_url, headers=headers, httpx_client_factory=_mcp_http_client_factory
+        ) as (read_stream, write_stream, _):
             async with ClientSession(read_stream, write_stream) as session:
                 _step("Connecting to MCP")
                 t0 = time.perf_counter()
@@ -467,14 +645,17 @@ async def connect_mcp(base_url: str, mcp_path: str, access_token: str) -> None:
     except Exception as exc:
         detail = _unwrap_exception(exc)
         _print_mcp_error(detail, mcp_url)
+        # The MCP client hides the HTTP response; re-issue a raw request so the
+        # gateway's actual status/body (e.g. policy denial) is visible.
+        probe_mcp_raw(mcp_url, access_token)
         raise RuntimeError(f"MCP call failed for {mcp_url}: {detail}") from exc
 
 
 def get_env_or_exit() -> Tuple[str, str, str, str, str]:
     """Load required environment variables for OAuth 2.1 (PKCE + client credentials) and MCP; exit if missing.
 
-    When SKIP_OAUTH is not set, requires TENANT_URL, CLIENT_ID, CLIENT_SECRET, and REDIRECT_URI.
-    MCP_PATH defaults to DEFAULT_MCP_PATH if unset.
+    When SKIP_OAUTH is not set, requires TENANT_URL, CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, and MCP_PATH.
+    When SKIP_OAUTH is set, requires TENANT_URL and MCP_PATH.
 
     Returns:
         Tuple of (tenant_url, client_id, client_secret, redirect_uri, mcp_path).
@@ -483,18 +664,19 @@ def get_env_or_exit() -> Tuple[str, str, str, str, str]:
     client_id = os.getenv("CLIENT_ID", "").strip()
     client_secret = os.getenv("CLIENT_SECRET", "").strip()
     redirect_uri = os.getenv("REDIRECT_URI", "").strip()
-    mcp_path = os.getenv("MCP_PATH", "").strip() or DEFAULT_MCP_PATH
+    mcp_path = os.getenv("MCP_PATH", "").strip()
 
     def _exit_missing(names: list[str]) -> None:
         print(f"Missing env vars: {', '.join(names)}")
         sys.exit(1)
 
     if os.getenv("SKIP_OAUTH", "").lower() == "true":
-        if not tenant_url:
-            _exit_missing(["TENANT_URL"])
+        missing = [name for name, value in [("TENANT_URL", tenant_url), ("MCP_PATH", mcp_path)] if not value]
+        if missing:
+            _exit_missing(missing)
         return tenant_url, client_id, client_secret, redirect_uri, mcp_path
 
-    required = [("TENANT_URL", tenant_url), ("CLIENT_ID", client_id), ("CLIENT_SECRET", client_secret), ("REDIRECT_URI", redirect_uri)]
+    required = [("TENANT_URL", tenant_url), ("CLIENT_ID", client_id), ("CLIENT_SECRET", client_secret), ("REDIRECT_URI", redirect_uri), ("MCP_PATH", mcp_path)]
     missing = [name for name, value in required if not value]
     if missing:
         _exit_missing(missing)
@@ -541,7 +723,7 @@ async def main() -> None:
         if not access_token:
             raise RuntimeError(f"Token response missing access_token: {token}")
         print(tabulate([("Token exchange", _format_duration(elapsed))], headers=["Step", "Duration"], tablefmt="grid"))
-        print(f"Access token: {access_token[:10]}...{access_token[-10:]}")
+        _print_token_details(access_token)
 
     try:
         await connect_mcp(base_url, mcp_path, access_token)
