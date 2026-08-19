@@ -11,7 +11,8 @@ Environment variables:
     CLIENT_ID        OAuth client ID.
     CLIENT_SECRET    OAuth client secret (used with PKCE on token request).
     REDIRECT_URI      Callback URL (must be registered in CyberArk Identity).
-    MCP_PATH         MCP path (default: /mcp/deep-wiki).
+    MCP_PATH         MCP endpoint. A full URL (e.g. https://gw.example.com/mcp) is
+                     used as-is; a relative path (e.g. /mcp) is appended to TENANT_URL.
     SCOPE            OAuth scope (default: full).
     SKIP_OAUTH       If "true", use ACCESS_TOKEN from env and skip OAuth.
     ACCESS_TOKEN     Used when SKIP_OAUTH=true.
@@ -48,23 +49,18 @@ from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 from tabulate import tabulate
 
+# Shared helpers live in oauth_common.py so both examples stay in sync.
+from oauth_common import (
+    decode_jwt_segment,
+    format_duration,
+    normalize_base_url,
+    print_token_details,
+    step,
+    verify_tls,
+)
+
 # Callback wait timeout (seconds). The MCP path comes from the MCP_PATH env var.
 CALLBACK_TIMEOUT = 300
-
-
-def _verify_tls() -> bool:
-    """Whether to verify TLS certs. Set INSECURE_SKIP_VERIFY=true to disable.
-
-    WARNING: disabling verification is for dev/integration environments with
-    self-signed certs only. Never use it with production credentials.
-    """
-    skip = os.getenv("INSECURE_SKIP_VERIFY", "").lower() == "true"
-    if skip:
-        # Silence the per-request InsecureRequestWarning from urllib3.
-        from urllib3.exceptions import InsecureRequestWarning
-
-        requests.packages.urllib3.disable_warnings(InsecureRequestWarning)  # type: ignore[attr-defined]
-    return not skip
 
 
 def _mcp_http_client_factory(
@@ -82,7 +78,7 @@ def _mcp_http_client_factory(
         MCP_DEFAULT_TIMEOUT,
     )
 
-    kwargs: Dict[str, Any] = {"follow_redirects": True, "verify": _verify_tls()}
+    kwargs: Dict[str, Any] = {"follow_redirects": True, "verify": verify_tls()}
     if timeout is None:
         kwargs["timeout"] = httpx.Timeout(MCP_DEFAULT_TIMEOUT, read=MCP_DEFAULT_SSE_READ_TIMEOUT)
     else:
@@ -92,11 +88,6 @@ def _mcp_http_client_factory(
     if auth is not None:
         kwargs["auth"] = auth
     return httpx.AsyncClient(**kwargs)
-
-
-def _step(msg: str) -> None:
-    """Print a step label to stdout."""
-    print(f"\n==> {msg}")
 
 
 def _to_jsonable(obj: Any) -> Any:
@@ -140,66 +131,6 @@ def _normalize_tool_result(result: Any) -> dict[str, Any]:
     if not out:
         return _to_jsonable(result) if isinstance(_to_jsonable(result), dict) else {"result": _to_jsonable(result)}
     return out
-
-
-def _format_duration(seconds: float) -> str:
-    """Format a duration in seconds for display (e.g. 1.23s or 456 ms)."""
-    if seconds >= 1.0:
-        return f"{seconds:.2f}s"
-    return f"{seconds * 1000:.0f} ms"
-
-
-def _decode_jwt_segment(segment: str) -> dict[str, Any]:
-    """Base64url-decode a single JWT segment (header or payload) into a dict."""
-    padded = segment + "=" * (-len(segment) % 4)
-    return json.loads(base64.urlsafe_b64decode(padded.encode()))
-
-
-def _print_token_details(access_token: str) -> None:
-    """Print the full access token and, if it is a JWT, its decoded claims.
-
-    Helps diagnose why a token is rejected: check aud (audience/resource),
-    scope, iss (issuer), and exp (expiry) against what the MCP resource expects.
-    """
-    print(f"Access token (full):\n{access_token}\n")
-    parts = access_token.split(".")
-    if len(parts) != 3:
-        print("Token is not a JWT (opaque token) — cannot decode claims locally.")
-        return
-    try:
-        header = _decode_jwt_segment(parts[0])
-        payload = _decode_jwt_segment(parts[1])
-    except Exception as exc:  # noqa: BLE001
-        print(f"Could not decode JWT: {exc}")
-        return
-    print("JWT header:")
-    print(json.dumps(header, indent=2, sort_keys=True))
-    print("JWT claims:")
-    print(json.dumps(payload, indent=2, sort_keys=True, default=str))
-
-    # Show the claims most relevant to whether the resource will accept the token.
-    rows: list[tuple[str, str]] = []
-    for claim in ("iss", "aud", "scope", "scp", "sub", "client_id", "azp", "agent_name"):
-        if claim in payload:
-            rows.append((claim, str(payload[claim])))
-
-    # Verdict: locally we can only check structure + expiry (signature needs the
-    # issuer's JWKS). Report expiry explicitly and note the limits of a local check.
-    exp = payload.get("exp")
-    expired = False
-    if isinstance(exp, (int, float)):
-        remaining = exp - time.time()
-        expired = remaining < 0
-        rows.append(("exp", f"{'EXPIRED ' + format(abs(remaining), '.0f') + 's ago' if expired else 'valid for ' + format(remaining, '.0f') + 's'}"))
-    else:
-        rows.append(("exp", "not present"))
-
-    if expired:
-        verdict = "INVALID — token has expired; run the OAuth flow again."
-    else:
-        verdict = "VALID (structurally): well-formed JWT, not expired. NOTE: signature/audience not verified locally — only the gateway can fully validate."
-    rows.append(("Token verdict", verdict))
-    print("\n" + tabulate(rows, headers=["Claim", "Value"], tablefmt="grid"))
 
 
 def _unwrap_exception(exc: BaseException) -> BaseException:
@@ -252,7 +183,7 @@ def probe_mcp_raw(mcp_url: str, access_token: str) -> None:
     policy/routing details in the body are lost. This bypasses it to show the
     exact status, headers, and body the gateway returns.
     """
-    _step("Raw gateway response probe")
+    step("Raw gateway response probe")
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -274,7 +205,7 @@ def probe_mcp_raw(mcp_url: str, access_token: str) -> None:
             },
             json=payload,
             timeout=30,
-            verify=_verify_tls(),
+            verify=verify_tls(),
         )
     except Exception as exc:  # noqa: BLE001
         print(f"Raw probe request failed: {type(exc).__name__}: {exc}")
@@ -420,29 +351,6 @@ def generate_pkce_pair() -> Tuple[str, str]:
     return code_verifier, code_challenge
 
 
-def normalize_base_url(tenant_url: str) -> str:
-    """Normalize the tenant URL for use in OAuth and MCP requests.
-
-    Ensures a scheme (https if missing), strips whitespace, and removes
-    a trailing slash. Raises if the value is empty.
-
-    Args:
-        tenant_url: Raw TENANT_URL from env (e.g. host only or full URL).
-
-    Returns:
-        Base URL with scheme and no trailing slash (e.g. https://host.example.com).
-
-    Raises:
-        ValueError: If tenant_url is empty or whitespace-only.
-    """
-    if not tenant_url or not tenant_url.strip():
-        raise ValueError("TENANT_URL is required")
-    base = tenant_url.strip()
-    if not base.startswith(("http://", "https://")):
-        base = f"https://{base}"
-    return base.rstrip("/")
-
-
 def build_authorize_url(
     base_url: str,
     client_id: str,
@@ -579,13 +487,32 @@ def exchange_code_for_token(
         },
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         timeout=30,
-        verify=_verify_tls(),
+        verify=verify_tls(),
     )
     response.raise_for_status()
     return response.json()
 
 
-async def connect_mcp(base_url: str, mcp_path: str, access_token: str) -> None:
+def resolve_mcp_url(base_url: str, mcp_path: str) -> str:
+    """Resolve the MCP endpoint URL from MCP_PATH.
+
+    If mcp_path is a full URL (has an http/https scheme), it is used as-is and
+    TENANT_URL is ignored for the MCP connection. Otherwise it is treated as a
+    relative path and appended to base_url.
+
+    Args:
+        base_url: Gateway base URL (no trailing slash).
+        mcp_path: Full MCP URL or a relative path (e.g. /mcp/deep-wiki).
+
+    Returns:
+        The full MCP endpoint URL.
+    """
+    if urlparse(mcp_path).scheme in ("http", "https"):
+        return mcp_path.rstrip("/")
+    return f"{base_url}/{mcp_path.lstrip('/')}"
+
+
+async def connect_mcp(mcp_url: str, access_token: str) -> None:
     """Connect to the MCP endpoint, initialize, list tools, and optionally call a tool.
 
     Uses TOOL_NAME and TOOL_ARGS_JSON from the environment when invoking a tool.
@@ -593,11 +520,9 @@ async def connect_mcp(base_url: str, mcp_path: str, access_token: str) -> None:
     On failure, prints a user-friendly error summary and re-raises.
 
     Args:
-        base_url: Gateway base URL (no trailing slash).
-        mcp_path: MCP path (e.g. /mcp or /mcp/deep-wiki).
+        mcp_url: Full MCP endpoint URL (e.g. https://gw.example.com/mcp).
         access_token: Bearer token from OAuth2 token endpoint.
     """
-    mcp_url = f"{base_url}{mcp_path}"
     headers = {"Authorization": f"Bearer {access_token}"}
     tool_name = os.getenv("TOOL_NAME", "").strip()
     tool_args_raw = os.getenv("TOOL_ARGS_JSON", "").strip()
@@ -614,33 +539,33 @@ async def connect_mcp(base_url: str, mcp_path: str, access_token: str) -> None:
             url=mcp_url, headers=headers, httpx_client_factory=_mcp_http_client_factory
         ) as (read_stream, write_stream, _):
             async with ClientSession(read_stream, write_stream) as session:
-                _step("Connecting to MCP")
+                step("Connecting to MCP")
                 t0 = time.perf_counter()
                 init_result = await session.initialize()
-                timings.append(("initialize()", _format_duration(time.perf_counter() - t0)))
-                _step("MCP server info")
+                timings.append(("initialize()", format_duration(time.perf_counter() - t0)))
+                step("MCP server info")
                 server_info = getattr(init_result, "server_info", None)
                 _print_init_table("Server:" if server_info is not None else "Init response:", server_info or init_result)
 
                 # List tools by default; set LIST_TOOLS=false to skip when calling a single tool
                 list_tools = os.getenv("LIST_TOOLS", "true").lower() != "false"
                 if list_tools:
-                    _step("List tools")
+                    step("List tools")
                     t0 = time.perf_counter()
                     tools_result = await session.list_tools()
-                    timings.append(("list_tools()", _format_duration(time.perf_counter() - t0)))
+                    timings.append(("list_tools()", format_duration(time.perf_counter() - t0)))
                     _print_tools_table(getattr(tools_result, "tools", []) or [])
 
                 if tool_name:
-                    _step(f"Calling tool: {tool_name}")
+                    step(f"Calling tool: {tool_name}")
                     t0 = time.perf_counter()
                     result = await session.call_tool(tool_name, tool_args)
-                    timings.append((f"call_tool({tool_name!r})", _format_duration(time.perf_counter() - t0)))
+                    timings.append((f"call_tool({tool_name!r})", format_duration(time.perf_counter() - t0)))
                     print(f"Tool result ({tool_name}):")
                     print(json.dumps(_normalize_tool_result(result), indent=2, sort_keys=True, default=str))
 
                 if timings:
-                    _step("Timings")
+                    step("Timings")
                     print(tabulate(timings, headers=["Step", "Duration"], tablefmt="grid"))
     except Exception as exc:
         detail = _unwrap_exception(exc)
@@ -656,6 +581,8 @@ def get_env_or_exit() -> Tuple[str, str, str, str, str]:
 
     When SKIP_OAUTH is not set, requires TENANT_URL, CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, and MCP_PATH.
     When SKIP_OAUTH is set, requires TENANT_URL and MCP_PATH.
+
+    MCP_PATH may be a full URL (used as-is) or a relative path (appended to TENANT_URL).
 
     Returns:
         Tuple of (tenant_url, client_id, client_secret, redirect_uri, mcp_path).
@@ -693,10 +620,22 @@ async def main() -> None:
     load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
     tenant_url, client_id, client_secret, redirect_uri, mcp_path = get_env_or_exit()
     base_url = normalize_base_url(tenant_url)
-    scope = os.getenv("SCOPE", "full")
+    mcp_url = resolve_mcp_url(base_url, mcp_path)
+    # Scope for minting the token via the authorization_code flow. Prefer
+    # OAUTH_SCOPE; fall back to legacy SCOPE, then "full".
+    scope = os.getenv("OAUTH_SCOPE", "").strip() or os.getenv("SCOPE", "").strip() or "full"
+
+    # Show the resolved endpoints up front so the token source (IdP) and the
+    # MCP target are unambiguous — they can be different hosts.
+    step("Configuration")
+    print(tabulate(
+        [("IdP (OAuth) base URL", base_url), ("MCP endpoint URL", mcp_url)],
+        headers=["Setting", "Value"],
+        tablefmt="grid",
+    ))
 
     if os.getenv("SKIP_OAUTH", "").lower() == "true":
-        _step("Using ACCESS_TOKEN from .env")
+        step("Using ACCESS_TOKEN from .env")
         access_token = os.getenv("ACCESS_TOKEN", "dev-token")
     else:
         code_verifier, code_challenge = generate_pkce_pair()
@@ -704,29 +643,29 @@ async def main() -> None:
         callback_server = CallbackServer(redirect_uri)
         callback_server.start()
         auth_url = build_authorize_url(base_url, client_id, redirect_uri, scope, code_challenge, state)
-        _step("Open this URL to authorize")
+        step("Open this URL to authorize")
         print(auth_url)
         try:
             webbrowser.open(auth_url)
         except Exception:
             pass
         try:
-            _step("Waiting for authorization callback")
+            step("Waiting for authorization callback")
             code = callback_server.wait_for_code()
         finally:
             callback_server.stop()
-        _step("Exchanging code for access token (OAuth 2.1 PKCE + client credentials)")
+        step("Exchanging code for access token (OAuth 2.1 PKCE + client credentials)")
         t0 = time.perf_counter()
         token = exchange_code_for_token(base_url, client_id, client_secret, code, redirect_uri, code_verifier)
         elapsed = time.perf_counter() - t0
         access_token = token.get("access_token")
         if not access_token:
             raise RuntimeError(f"Token response missing access_token: {token}")
-        print(tabulate([("Token exchange", _format_duration(elapsed))], headers=["Step", "Duration"], tablefmt="grid"))
-        _print_token_details(access_token)
+        print(tabulate([("Token exchange", format_duration(elapsed))], headers=["Step", "Duration"], tablefmt="grid"))
+        print_token_details(access_token)
 
     try:
-        await connect_mcp(base_url, mcp_path, access_token)
+        await connect_mcp(mcp_url, access_token)
     except Exception:
         sys.exit(1)
 
