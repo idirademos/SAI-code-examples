@@ -68,13 +68,33 @@ def decode_jwt_segment(segment: str) -> dict[str, Any]:
     return json.loads(base64.urlsafe_b64decode(padded.encode()))
 
 
-def print_token_details(access_token: str) -> None:
-    """Print the full access token and, if it is a JWT, its decoded claims.
+def redact_token(access_token: str) -> str:
+    """Mask a token for display, keeping only a short head/tail for identification.
+
+    e.g. "eyJhbGciOi…_BwzDBkCg (redacted, 812 chars)". Enough to tell two tokens
+    apart in a log without exposing a usable credential.
+    """
+    if not access_token:
+        return "(empty)"
+    if len(access_token) <= 16:
+        return f"…(redacted, {len(access_token)} chars)"
+    return f"{access_token[:10]}…{access_token[-8:]} (redacted, {len(access_token)} chars)"
+
+
+def print_token_details(access_token: str, redact: bool = True) -> None:
+    """Print the access token and, if it is a JWT, its decoded claims.
 
     Helps diagnose why a token is rejected: check aud (audience/resource),
     scope, iss (issuer), and exp (expiry) against what the resource expects.
+
+    Args:
+        access_token: The bearer token to inspect.
+        redact: When True (default), mask the raw token so it is safe to paste
+            into a chat/log. Claims are still decoded and shown. Set False to
+            print the full token (needed when copying it for a manual request).
     """
-    print(f"Access token (full):\n{access_token}\n")
+    shown = redact_token(access_token) if redact else access_token
+    print(f"Access token{' (redacted)' if redact else ' (full)'}:\n{shown}\n")
     parts = access_token.split(".")
     if len(parts) != 3:
         print("Token is not a JWT (opaque token) — cannot decode claims locally.")

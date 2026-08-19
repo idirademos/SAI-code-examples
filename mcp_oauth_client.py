@@ -16,6 +16,7 @@ Environment variables:
     SCOPE            OAuth scope (default: full).
     SKIP_OAUTH       If "true", use ACCESS_TOKEN from env and skip OAuth.
     ACCESS_TOKEN     Used when SKIP_OAUTH=true.
+    SHOW_TOKEN       If "true", print the full access token (default: redacted).
     TOOL_NAME        Optional MCP tool to call.
     TOOL_ARGS_JSON   Optional JSON object of arguments for the tool.
     LIST_TOOLS       If "false", skip listing tools when TOOL_NAME is set (default: true, always list).
@@ -287,56 +288,55 @@ def _print_init_table(label: str, obj: Any) -> None:
     print(tabulate(truncated, headers=["Key", "Value"], tablefmt="grid"))
 
 
-def _tool_annotations_row(t: Any) -> tuple[str, str]:
-    """Extract (name, annotations summary) for one tool for display."""
-    name = getattr(t, "name", None) or ""
+def _tool_hints(t: Any) -> str:
+    """Compact annotation hints for one tool, e.g. "RO IDEM" (empty if none).
+
+    Maps ToolAnnotations booleans to short flags so they fit one narrow column:
+    RO=readOnlyHint, DESTR=destructiveHint, IDEM=idempotentHint, OPEN=openWorldHint.
+    """
     ann = getattr(t, "annotations", None)
     if ann is None:
-        return name, "—"
-    parts = []
-    for key in ("title", "readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"):
-        val = getattr(ann, key, None)
-        if val is not None:
-            parts.append(f"{key}={val}")
-    return name, " ".join(parts) if parts else "—"
+        return "—"
+    flags = []
+    for attr, flag in (("readOnlyHint", "RO"), ("destructiveHint", "DESTR"),
+                       ("idempotentHint", "IDEM"), ("openWorldHint", "OPEN")):
+        if getattr(ann, attr, None):
+            flags.append(flag)
+    return " ".join(flags) if flags else "—"
 
 
 def _print_tools_table(tool_list: list) -> None:
-    """Print MCP tools as Name | Description table, then MCP annotations per tool (tabulate grid)."""
+    """Print MCP tools as one compact table: Name | Desc | Hints | Args.
+
+    A single table (instead of separate description/annotation/schema tables)
+    keeps the output short enough to paste into a Slack message. Description is
+    truncated and args show required keys ("*" marks required) so one row per
+    tool carries the essentials.
+    """
     print("Available tools:")
     if not tool_list:
         print("(none)")
         return
-    desc_w = 72
+    desc_w = 48
     rows = []
     for t in tool_list:
         name = getattr(t, "name", None) or ""
         desc = (getattr(t, "description", None) or "").replace("\n", " ").strip()
         if len(desc) > desc_w:
             desc = desc[: desc_w - 3] + "..."
-        rows.append((name, desc))
-    print(tabulate(rows, headers=["Name", "Description"], tablefmt="grid"))
 
-    # MCP annotations (ToolAnnotations: title, readOnlyHint, destructiveHint, idempotentHint, openWorldHint)
-    ann_rows = [_tool_annotations_row(t) for t in tool_list]
-    if any(cell != "—" for _, cell in ann_rows):
-        print("\nMCP annotations (per tool):")
-        print(tabulate(ann_rows, headers=["Tool", "Annotations"], tablefmt="grid"))
-
-    # inputSchema summary (required / properties) when present
-    schema_rows: list[tuple[str, str]] = []
-    for t in tool_list:
-        name = getattr(t, "name", None) or ""
         schema = getattr(t, "inputSchema", None) or {}
-        if isinstance(schema, dict) and schema:
-            req = schema.get("required", [])
-            props = schema.get("properties", {})
-            req_s = ", ".join(req) if req else "—"
-            prop_names = ", ".join(props.keys())[:80] if props else "—"
-            schema_rows.append((name, f"required: [{req_s}]  properties: {prop_names}"))
-    if schema_rows:
-        print("\nInput schema (per tool):")
-        print(tabulate(schema_rows, headers=["Tool", "Schema"], tablefmt="grid"))
+        args = "—"
+        if isinstance(schema, dict) and schema.get("properties"):
+            required = set(schema.get("required", []))
+            names = [f"{k}*" if k in required else k for k in schema["properties"].keys()]
+            args = ", ".join(names)
+            if len(args) > desc_w:
+                args = args[: desc_w - 3] + "..."
+
+        rows.append((name, desc, _tool_hints(t), args))
+    print(tabulate(rows, headers=["Name", "Description", "Hints", "Args (*=required)"], tablefmt="grid"))
+    print("Hints: RO=read-only DESTR=destructive IDEM=idempotent OPEN=open-world")
 
 
 def generate_pkce_pair() -> Tuple[str, str]:
@@ -624,6 +624,8 @@ async def main() -> None:
     # Scope for minting the token via the authorization_code flow. Prefer
     # OAUTH_SCOPE; fall back to legacy SCOPE, then "full".
     scope = os.getenv("OAUTH_SCOPE", "").strip() or os.getenv("SCOPE", "").strip() or "full"
+    # Redact the access token by default; SHOW_TOKEN=true prints it in full.
+    show_token = os.getenv("SHOW_TOKEN", "").lower() == "true"
 
     # Show the resolved endpoints up front so the token source (IdP) and the
     # MCP target are unambiguous — they can be different hosts.
@@ -662,7 +664,7 @@ async def main() -> None:
         if not access_token:
             raise RuntimeError(f"Token response missing access_token: {token}")
         print(tabulate([("Token exchange", format_duration(elapsed))], headers=["Step", "Duration"], tablefmt="grid"))
-        print_token_details(access_token)
+        print_token_details(access_token, redact=not show_token)
 
     try:
         await connect_mcp(mcp_url, access_token)
