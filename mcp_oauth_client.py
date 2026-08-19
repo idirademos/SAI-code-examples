@@ -17,6 +17,7 @@ Environment variables:
     SKIP_OAUTH       If "true", use ACCESS_TOKEN from env and skip OAuth.
     ACCESS_TOKEN     Used when SKIP_OAUTH=true.
     SHOW_TOKEN       If "true", print the full access token (default: redacted).
+    SHOW_TOKEN_JSON  If "true", also dump full JWT header/claims as JSON (default: table only).
     TOOL_NAME        Optional MCP tool to call.
     TOOL_ARGS_JSON   Optional JSON object of arguments for the tool.
     LIST_TOOLS       If "false", skip listing tools when TOOL_NAME is set (default: true, always list).
@@ -288,30 +289,31 @@ def _print_init_table(label: str, obj: Any) -> None:
     print(tabulate(truncated, headers=["Key", "Value"], tablefmt="grid"))
 
 
-def _tool_hints(t: Any) -> str:
-    """Compact annotation hints for one tool, e.g. "RO IDEM" (empty if none).
+# MCP ToolAnnotations rendered as one boolean column each.
+# (column header, annotation attribute) — "public" maps to openWorldHint.
+_MCP_ANNOTATION_COLUMNS = (
+    ("RO", "readOnlyHint"),
+    ("Idempotent", "idempotentHint"),
+    ("Destructive", "destructiveHint"),
+    ("Public", "openWorldHint"),
+)
 
-    Maps ToolAnnotations booleans to short flags so they fit one narrow column:
-    RO=readOnlyHint, DESTR=destructiveHint, IDEM=idempotentHint, OPEN=openWorldHint.
-    """
-    ann = getattr(t, "annotations", None)
-    if ann is None:
+
+def _annotation_cell(ann: Any, attr: str) -> str:
+    """Render one MCP annotation as "true"/"false", or "—" when unset."""
+    val = getattr(ann, attr, None) if ann is not None else None
+    if val is None:
         return "—"
-    flags = []
-    for attr, flag in (("readOnlyHint", "RO"), ("destructiveHint", "DESTR"),
-                       ("idempotentHint", "IDEM"), ("openWorldHint", "OPEN")):
-        if getattr(ann, attr, None):
-            flags.append(flag)
-    return " ".join(flags) if flags else "—"
+    return "true" if val else "false"
 
 
 def _print_tools_table(tool_list: list) -> None:
-    """Print MCP tools as one compact table: Name | Desc | Hints | Args.
+    """Print MCP tools as one compact table with a column per MCP annotation.
 
     A single table (instead of separate description/annotation/schema tables)
-    keeps the output short enough to paste into a Slack message. Description is
-    truncated and args show required keys ("*" marks required) so one row per
-    tool carries the essentials.
+    keeps the output short enough to paste into a Slack message. Columns:
+    Name | Description | RO | Idempotent | Destructive | Public | Args.
+    Description is truncated and args mark required keys with "*".
     """
     print("Available tools:")
     if not tool_list:
@@ -325,6 +327,9 @@ def _print_tools_table(tool_list: list) -> None:
         if len(desc) > desc_w:
             desc = desc[: desc_w - 3] + "..."
 
+        ann = getattr(t, "annotations", None)
+        ann_cells = [_annotation_cell(ann, attr) for _, attr in _MCP_ANNOTATION_COLUMNS]
+
         schema = getattr(t, "inputSchema", None) or {}
         args = "—"
         if isinstance(schema, dict) and schema.get("properties"):
@@ -334,9 +339,10 @@ def _print_tools_table(tool_list: list) -> None:
             if len(args) > desc_w:
                 args = args[: desc_w - 3] + "..."
 
-        rows.append((name, desc, _tool_hints(t), args))
-    print(tabulate(rows, headers=["Name", "Description", "Hints", "Args (*=required)"], tablefmt="grid"))
-    print("Hints: RO=read-only DESTR=destructive IDEM=idempotent OPEN=open-world")
+        rows.append((name, desc, *ann_cells, args))
+    headers = ["Name", "Description", *(h for h, _ in _MCP_ANNOTATION_COLUMNS), "Args (*=required)"]
+    print(tabulate(rows, headers=headers, tablefmt="grid"))
+    print("MCP annotations: RO=read-only  Public=open-world")
 
 
 def generate_pkce_pair() -> Tuple[str, str]:
@@ -626,6 +632,8 @@ async def main() -> None:
     scope = os.getenv("OAUTH_SCOPE", "").strip() or os.getenv("SCOPE", "").strip() or "full"
     # Redact the access token by default; SHOW_TOKEN=true prints it in full.
     show_token = os.getenv("SHOW_TOKEN", "").lower() == "true"
+    # SHOW_TOKEN_JSON=true also dumps the full JWT header/claims as JSON.
+    show_token_json = os.getenv("SHOW_TOKEN_JSON", "").lower() == "true"
 
     # Show the resolved endpoints up front so the token source (IdP) and the
     # MCP target are unambiguous — they can be different hosts.
@@ -664,7 +672,7 @@ async def main() -> None:
         if not access_token:
             raise RuntimeError(f"Token response missing access_token: {token}")
         print(tabulate([("Token exchange", format_duration(elapsed))], headers=["Step", "Duration"], tablefmt="grid"))
-        print_token_details(access_token, redact=not show_token)
+        print_token_details(access_token, redact=not show_token, show_json=show_token_json)
 
     try:
         await connect_mcp(mcp_url, access_token)

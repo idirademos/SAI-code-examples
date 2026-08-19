@@ -81,7 +81,7 @@ def redact_token(access_token: str) -> str:
     return f"{access_token[:10]}…{access_token[-8:]} (redacted, {len(access_token)} chars)"
 
 
-def print_token_details(access_token: str, redact: bool = True) -> None:
+def print_token_details(access_token: str, redact: bool = True, show_json: bool = False) -> None:
     """Print the access token and, if it is a JWT, its decoded claims.
 
     Helps diagnose why a token is rejected: check aud (audience/resource),
@@ -92,6 +92,8 @@ def print_token_details(access_token: str, redact: bool = True) -> None:
         redact: When True (default), mask the raw token so it is safe to paste
             into a chat/log. Claims are still decoded and shown. Set False to
             print the full token (needed when copying it for a manual request).
+        show_json: When True, also dump the full JWT header and claims as JSON
+            (verbose). Default False keeps output to the summary claims table.
     """
     shown = redact_token(access_token) if redact else access_token
     print(f"Access token{' (redacted)' if redact else ' (full)'}:\n{shown}\n")
@@ -105,10 +107,12 @@ def print_token_details(access_token: str, redact: bool = True) -> None:
     except Exception as exc:  # noqa: BLE001
         print(f"Could not decode JWT: {exc}")
         return
-    print("JWT header:")
-    print(json.dumps(header, indent=2, sort_keys=True))
-    print("JWT claims:")
-    print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+
+    if show_json:
+        print("JWT header:")
+        print(json.dumps(header, indent=2, sort_keys=True))
+        print("JWT claims:")
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
 
     rows: list[tuple[str, str]] = [(c, str(payload[c])) for c in _INTERESTING_CLAIMS if c in payload]
 
